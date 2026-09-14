@@ -1,0 +1,27 @@
+Third-Party Notices
+===================
+
+1. PyMuPDF
+----------
+Project: PyMuPDF
+Used for: PDF reading, page composition, saving, and JPG rendering.
+Licensing: PyMuPDF is offered under GNU AGPL and commercial licensing options.
+Project site: https://pymupdf.io/
+
+This project follows the AGPL route. Review the current PyMuPDF licensing terms before redistribution.
+
+2. tkinterdnd2
+--------------
+Project: tkinterdnd2
+Used for: drag-and-drop support in the Tkinter GUI.
+Package page: https://pypi.org/project/tkinterdnd2/
+
+Its own license remains applicable. Verify the package's current license metadata when redistributing bundled copies.
+
+3. Python / Tkinter
+-------------------
+Python and Tkinter are used as the runtime and GUI framework. Their own licenses remain applicable.
+
+4. PyInstaller
+--------------
+PyInstaller is not required to run the source version. It is only needed if a standalone EXE is built. Its license and the licenses of bundled dependencies remain applicable to the resulting distribution.
