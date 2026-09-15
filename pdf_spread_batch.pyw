@@ -1,5 +1,5 @@
-import os, sys, subprocess, traceback, threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import os, sys, subprocess, traceback, threading, multiprocessing
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -12,14 +12,8 @@ def ensure_pymupdf():
         import pymupdf
         return pymupdf
 
-def unique_output_paths(output_dir, base_name, need_jpg):
-    """
-    Never overwrite an existing PDF or reuse an existing JPG folder.
-    Keep PDF and JPG folder names matched:
-      name.pdf + name/
-      name (1).pdf + name (1)/
-      name (2).pdf + name (2)/
-    """
+def unique_output_paths(output_dir, base_name, need_pdf=True, need_jpg=False):
+    """Choose a conflict-safe matched name without overwriting existing output."""
     n = 0
     while True:
         suffix = "" if n == 0 else f" ({n})"
@@ -27,7 +21,7 @@ def unique_output_paths(output_dir, base_name, need_jpg):
         pdf_path = os.path.join(output_dir, candidate_name + ".pdf")
         jpg_dir = os.path.join(output_dir, candidate_name)
 
-        pdf_conflict = os.path.exists(pdf_path)
+        pdf_conflict = need_pdf and os.path.exists(pdf_path)
         jpg_conflict = need_jpg and os.path.exists(jpg_dir)
 
         if not pdf_conflict and not jpg_conflict:
@@ -68,32 +62,32 @@ def merge_pdf(input_path, output_path, keep_front):
     out.close()
     src.close()
 
-def _render_one_jpg(pdf_path, page_no, out_path, dpi, quality, pause_event):
-    # Pause takes effect between pages. A page already rendering will finish first.
-    pause_event.wait()
-
-    pm = ensure_pymupdf()
+def _render_one_jpg_process(pdf_path, page_no, out_path, dpi, quality):
+    # Top-level worker so Windows multiprocessing / PyInstaller can spawn it safely.
+    import pymupdf as pm
     doc = pm.open(pdf_path)
-    page = doc.load_page(page_no)
-    scale = float(dpi) / 72.0
-    pix = page.get_pixmap(matrix=pm.Matrix(scale, scale), alpha=False)
-
-    pause_event.wait()
-
     try:
-        data = pix.tobytes("jpeg", jpg_quality=int(quality))
-        with open(out_path, "wb") as f:
-            f.write(data)
-    except TypeError:
-        pix.save(out_path)
+        page = doc.load_page(page_no)
+        scale = float(dpi) / 72.0
+        pix = page.get_pixmap(matrix=pm.Matrix(scale, scale), alpha=False)
+        try:
+            data = pix.tobytes("jpeg", jpg_quality=int(quality))
+            with open(out_path, "wb") as f:
+                f.write(data)
+        except TypeError:
+            pix.save(out_path)
+    finally:
+        doc.close()
+    return page_no
 
-    doc.close()
 
-def export_pdf_to_jpg(pdf_path, jpg_dir, dpi=150, quality=90, pause_event=None, progress_callback=None):
+def export_pdf_to_jpg(pdf_path, jpg_dir, dpi=150, quality=90, pause_event=None,
+                      progress_callback=None, workers=None):
     if pause_event is None:
         pause_event = threading.Event()
         pause_event.set()
 
+    # Ensure the dependency exists before child processes are spawned.
     pm = ensure_pymupdf()
     doc = pm.open(pdf_path)
     page_count = doc.page_count
@@ -102,25 +96,37 @@ def export_pdf_to_jpg(pdf_path, jpg_dir, dpi=150, quality=90, pause_event=None, 
     os.makedirs(jpg_dir, exist_ok=True)
     digits = max(3, len(str(page_count)))
 
-    cpu = os.cpu_count() or 4
-    workers = min(4, max(2, cpu // 2), max(1, page_count))
+    cpu = os.cpu_count() or 2
+    if workers is None:
+        workers = max(1, cpu - 1)
+    workers = max(1, min(int(workers), cpu, max(1, page_count)))
 
-    jobs = []
     done_count = 0
+    next_page = 0
+    pending = set()
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for i in range(page_count):
-            out_path = os.path.join(jpg_dir, f"{i+1:0{digits}d}.jpg")
-            jobs.append(pool.submit(
-                _render_one_jpg,
-                pdf_path, i, out_path, dpi, quality, pause_event
-            ))
+    # Keep only about one batch in flight. This makes Pause responsive: already
+    # running pages finish, but no new pages are dispatched while paused.
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        while done_count < page_count:
+            while pause_event.is_set() and next_page < page_count and len(pending) < workers:
+                out_path = os.path.join(jpg_dir, f"{next_page+1:0{digits}d}.jpg")
+                pending.add(pool.submit(
+                    _render_one_jpg_process,
+                    pdf_path, next_page, out_path, dpi, quality
+                ))
+                next_page += 1
 
-        for job in as_completed(jobs):
-            job.result()
-            done_count += 1
-            if progress_callback:
-                progress_callback(done_count, page_count)
+            if not pending:
+                pause_event.wait()
+                continue
+
+            finished, pending = wait(pending, timeout=0.15, return_when=FIRST_COMPLETED)
+            for job in finished:
+                job.result()
+                done_count += 1
+                if progress_callback:
+                    progress_callback(done_count, page_count)
 
 
 def get_root_base():
@@ -144,13 +150,13 @@ RootBase, DND_AVAILABLE = get_root_base()
 class App(RootBase):
     def __init__(self, initial_files=None):
         super().__init__()
-        self.title("PDF Spread Batch Tool")
-        self.geometry("850x700")
+        self.title("PDF Spread Batch Tool v16")
+        self.geometry("850x680")
         self.minsize(700, 620)
         self.files = []
         self.keep_var = tk.IntVar(value=0)
         self.output_dir = tk.StringVar(value="")
-        self.export_jpg_var = tk.BooleanVar(value=False)
+        self.output_mode_var = tk.StringVar(value="merge_pdf")
         self.jpg_dpi_var = tk.StringVar(value="150")
         self.pause_event = threading.Event()
         self.pause_event.set()
@@ -194,46 +200,52 @@ class App(RootBase):
         tk.Entry(out_frame, textvariable=self.output_dir).grid(row=0, column=0, sticky="ew", padx=(10,8), pady=10)
         tk.Button(out_frame, text="Browse...", command=self.choose_output_folder, width=12).grid(row=0, column=1, padx=(0,10), pady=10)
 
-        jpg_frame = tk.LabelFrame(self, text="JPG export")
-        jpg_frame.pack(fill="x", padx=14, pady=8)
+        mode_frame = tk.LabelFrame(self, text="Output mode")
+        mode_frame.pack(fill="x", padx=14, pady=8)
 
-        tk.Checkbutton(
-            jpg_frame,
-            text="Export JPG after merging",
-            variable=self.export_jpg_var
-        ).pack(side="left", padx=(12,18), pady=9)
+        tk.Radiobutton(
+            mode_frame,
+            text="Merge PDF only",
+            variable=self.output_mode_var,
+            value="merge_pdf"
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(8,3))
 
-        tk.Label(jpg_frame, text="DPI:").pack(side="left", pady=9)
+        tk.Radiobutton(
+            mode_frame,
+            text="Merge PDF + export merged pages as JPG",
+            variable=self.output_mode_var,
+            value="merge_jpg"
+        ).grid(row=1, column=0, sticky="w", padx=12, pady=3)
+
+        tk.Radiobutton(
+            mode_frame,
+            text="Original pages to JPG only (no merge, no PDF output)",
+            variable=self.output_mode_var,
+            value="original_jpg"
+        ).grid(row=2, column=0, sticky="w", padx=12, pady=(3,8))
+
+        tk.Label(mode_frame, text="DPI:").grid(row=0, column=1, rowspan=3, sticky="e", padx=(24,4), pady=8)
         dpi_box = ttk.Combobox(
-            jpg_frame,
+            mode_frame,
             textvariable=self.jpg_dpi_var,
             values=("150", "200", "300"),
             width=7,
             state="readonly"
         )
-        dpi_box.pack(side="left", padx=(6,12), pady=9)
+        dpi_box.grid(row=0, column=2, rowspan=3, sticky="w", padx=(2,12), pady=8)
 
-        tk.Label(
-            jpg_frame,
-            text="JPGs are saved in a subfolder using the original file name",
+        # Reserve the bottom controls before giving the file list the remaining space.
+        # This keeps Start / Pause visible even on shorter displays or with Windows
+        # display scaling enabled.
+        info_label = tk.Label(
+            self,
+            text="JPG export automatically uses all but one logical CPU core. Pause stops dispatching new pages.",
             fg="#666"
-        ).pack(side="left", padx=(8,12), pady=9)
-
-        frame = tk.Frame(self)
-        frame.pack(fill="both", expand=True, padx=14, pady=8)
-
-        self.tree = ttk.Treeview(frame, columns=("file","status"), show="headings", selectmode="extended")
-        self.tree.heading("file", text="PDF")
-        self.tree.heading("status", text="Status")
-        self.tree.column("file", width=650, anchor="w")
-        self.tree.column("status", width=130, anchor="center")
-        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
+        )
+        info_label.pack(side="bottom", pady=(0,8))
 
         bottom = tk.Frame(self)
-        bottom.pack(fill="x", padx=14, pady=(5,14))
+        bottom.pack(side="bottom", fill="x", padx=14, pady=(5,10))
         self.count_label = tk.Label(bottom, text="0 files")
         self.count_label.pack(side="left")
 
@@ -249,14 +261,27 @@ class App(RootBase):
 
         self.merge_button = tk.Button(
             bottom,
-            text="Merge All",
+            text="Start",
             command=self.merge_all,
             width=20,
             height=2
         )
         self.merge_button.pack(side="right")
 
-        tk.Label(self, text="Pause works during JPG export between pages; the current page finishes before pausing.", fg="#666").pack(pady=(0,12))
+        # The file list is the only vertically flexible area. It shrinks first
+        # when the window is short, rather than pushing the controls off-screen.
+        frame = tk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=14, pady=8)
+
+        self.tree = ttk.Treeview(frame, columns=("file","status"), show="headings", selectmode="extended")
+        self.tree.heading("file", text="PDF")
+        self.tree.heading("status", text="Status")
+        self.tree.column("file", width=650, anchor="w")
+        self.tree.column("status", width=130, anchor="center")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
 
         if initial_files:
             self.add_paths(initial_files)
@@ -334,7 +359,7 @@ class App(RootBase):
             if errors:
                 messagebox.showwarning(
                     "Finished",
-                    f"Done: {ok}/{total}\n\nErrors:\n" + "\n".join(errors[:10])
+                    f"Done: {ok}/{total}\\n\\nErrors:\\n" + "\\n".join(errors[:10])
                 )
             else:
                 messagebox.showinfo("Finished", f"All {ok} PDFs finished.")
@@ -357,8 +382,9 @@ class App(RootBase):
             return
 
         keep = self.keep_var.get()
-        export_jpg = self.export_jpg_var.get()
+        mode = self.output_mode_var.get()
         dpi = int(self.jpg_dpi_var.get())
+        process_workers = None  # automatic: logical CPU count - 1
 
         self.processing = True
         self.pause_event.set()
@@ -378,28 +404,42 @@ class App(RootBase):
                     self.pause_event.wait()
 
                     base_name = os.path.splitext(os.path.basename(src))[0]
+                    need_pdf = mode in ("merge_pdf", "merge_jpg")
+                    need_jpg = mode in ("merge_jpg", "original_jpg")
                     out, jpg_dir = unique_output_paths(
-                        output_dir, base_name, export_jpg
+                        output_dir, base_name, need_pdf=need_pdf, need_jpg=need_jpg
                     )
 
-                    self.ui_set_status(idx, "Merging PDF...")
-                    merge_pdf(src, out, keep)
+                    def jpg_progress(done, total, _idx=idx):
+                        self.ui_set_status(_idx, f"JPG {done}/{total}")
 
-                    if export_jpg:
-                        self.pause_event.wait()
-
-                        def jpg_progress(done, total, _idx=idx):
-                            self.ui_set_status(_idx, f"JPG {done}/{total}")
-
-                        self.ui_set_status(idx, "Exporting JPG...")
+                    if mode == "original_jpg":
+                        self.ui_set_status(idx, "Exporting original JPG...")
                         export_pdf_to_jpg(
-                            out,
+                            src,
                             jpg_dir,
                             dpi=dpi,
                             quality=90,
                             pause_event=self.pause_event,
-                            progress_callback=jpg_progress
+                            progress_callback=jpg_progress,
+                            workers=process_workers
                         )
+                    else:
+                        self.ui_set_status(idx, "Merging PDF...")
+                        merge_pdf(src, out, keep)
+
+                        if mode == "merge_jpg":
+                            self.pause_event.wait()
+                            self.ui_set_status(idx, "Exporting merged JPG...")
+                            export_pdf_to_jpg(
+                                out,
+                                jpg_dir,
+                                dpi=dpi,
+                                quality=90,
+                                pause_event=self.pause_event,
+                                progress_callback=jpg_progress,
+                                workers=process_workers
+                            )
 
                     self.ui_set_status(idx, "Done")
                     ok += 1
@@ -414,6 +454,7 @@ class App(RootBase):
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     try:
         dropped = [p for p in sys.argv[1:] if os.path.isfile(p) and p.lower().endswith(".pdf")]
         App(dropped).mainloop()
