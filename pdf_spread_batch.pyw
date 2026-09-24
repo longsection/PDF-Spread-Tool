@@ -238,7 +238,7 @@ RootBase, DND_AVAILABLE = get_root_base()
 class App(RootBase):
     def __init__(self, initial_files=None):
         super().__init__()
-        self.title("PDF Spread Batch Tool v16")
+        self.title("PDF Spread Tool")
         self.geometry("850x680")
         self.minsize(700, 620)
         self.files = []
@@ -273,7 +273,7 @@ class App(RootBase):
                 self.drop_label.drop_target_register(DND_FILES)
                 self.drop_label.dnd_bind("<<Drop>>", self.on_drop)
             except Exception:
-                self.drop_label.config(text="Drop unavailable - use Add PDFs")
+                self.drop_label.config(text="Drop unavailable - use Add PDFs/Images")
         else:
             self.drop_label.config(text="Drop unavailable - use Add PDFs")
 
@@ -362,7 +362,7 @@ class App(RootBase):
         frame.pack(fill="both", expand=True, padx=14, pady=8)
 
         self.tree = ttk.Treeview(frame, columns=("file","status"), show="headings", selectmode="extended")
-        self.tree.heading("file", text="PDF")
+        self.tree.heading("file", text="File")
         self.tree.heading("status", text="Status")
         self.tree.column("file", width=650, anchor="w")
         self.tree.column("status", width=130, anchor="center")
@@ -418,7 +418,7 @@ class App(RootBase):
             self.output_dir.set(folder)
 
     def add_files(self):
-        paths = filedialog.askopenfilenames(title="Choose PDFs or images", filetypes=[("PDF files","*.pdf")])
+        paths = filedialog.askopenfilenames(title="Choose PDFs or images", filetypes=[("PDF and images","*.pdf *.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff"),("Images","*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff"),("PDF files","*.pdf"),("All files","*.*")])
         self.add_paths(paths)
 
     def remove_selected(self):
@@ -463,6 +463,13 @@ class App(RootBase):
                 messagebox.showinfo("Finished", f"All {ok} PDFs finished.")
         self.after(0, finish)
 
+    def _finish_image_mode(self):
+        self.processing = False
+        self.pause_event.set()
+        self.pause_button.config(text="Pause", state="disabled")
+        self.merge_button.config(state="normal")
+        self.config(cursor="")
+
     def merge_all(self):
         if self.processing:
             return
@@ -490,7 +497,7 @@ class App(RootBase):
         self.merge_button.config(state="disabled")
         self.config(cursor="wait")
 
-        files_snapshot = list(self.files)
+        files_snapshot = [p for p in self.files if p.lower().endswith(".pdf")]\n        if not files_snapshot:\n            self._finish_image_mode()\n            messagebox.showwarning("No PDFs", "This output mode requires PDF files.")\n            return
 
         def worker():
             ok = 0
