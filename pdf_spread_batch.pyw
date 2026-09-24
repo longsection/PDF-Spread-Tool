@@ -245,7 +245,8 @@ class App(RootBase):
         self.keep_var = tk.IntVar(value=0)
         self.output_dir = tk.StringVar(value="")
         self.output_mode_var = tk.StringVar(value="merge_pdf")
-        self.jpg_dpi_var = tk.StringVar(value="Auto")\n        self.mode_buttons = {}
+        self.jpg_dpi_var = tk.StringVar(value="Auto")
+        self.mode_buttons = {}
         self.pause_event = threading.Event()
         self.pause_event.set()
         self.processing = False
@@ -275,7 +276,7 @@ class App(RootBase):
             except Exception:
                 self.drop_label.config(text="Drop unavailable - use Add PDFs/Images")
         else:
-            self.drop_label.config(text="Drop unavailable - use Add PDFs")
+            self.drop_label.config(text="Drop unavailable - use Add PDFs/Images")
 
         opt = tk.LabelFrame(self, text="Cover setting (applies to ALL files)")
         opt.pack(fill="x", padx=14, pady=8)
@@ -312,7 +313,9 @@ class App(RootBase):
             value="original_jpg"
         ).grid(row=2, column=0, sticky="w", padx=12, pady=(3,8))
 
-        self.image_spread_rb = tk.Radiobutton(mode_frame, text="Merge selected images side by side (0 gap)", variable=self.output_mode_var, value="image_spread")\n        self.image_spread_rb.grid(row=3, column=0, sticky="w", padx=12, pady=3)\n        tk.Label(mode_frame, text="DPI:").grid(row=0, column=1, rowspan=3, sticky="e", padx=(24,4), pady=8)
+        self.image_spread_rb = tk.Radiobutton(mode_frame, text="Merge selected images side by side (0 gap)", variable=self.output_mode_var, value="image_spread")
+        self.image_spread_rb.grid(row=3, column=0, sticky="w", padx=12, pady=3)
+        tk.Label(mode_frame, text="DPI:").grid(row=0, column=1, rowspan=3, sticky="e", padx=(24,4), pady=8)
         dpi_box = ttk.Combobox(
             mode_frame,
             textvariable=self.jpg_dpi_var,
@@ -488,7 +491,9 @@ class App(RootBase):
 
         keep = self.keep_var.get()
         mode = self.output_mode_var.get()
-        dpi = self.jpg_dpi_var.get()\n        if dpi != "Auto":\n            dpi = int(dpi)
+        dpi = self.jpg_dpi_var.get()
+        if dpi != "Auto":
+            dpi = int(dpi)
         process_workers = None  # automatic: logical CPU count - 1
 
         self.processing = True
@@ -497,7 +502,11 @@ class App(RootBase):
         self.merge_button.config(state="disabled")
         self.config(cursor="wait")
 
-        files_snapshot = [p for p in self.files if p.lower().endswith(".pdf")]\n        if not files_snapshot:\n            self._finish_image_mode()\n            messagebox.showwarning("No PDFs", "This output mode requires PDF files.")\n            return
+        files_snapshot = [p for p in self.files if p.lower().endswith(".pdf")]
+        if not files_snapshot:
+            self._finish_image_mode()
+            messagebox.showwarning("No PDFs", "This output mode requires PDF files.")
+            return
 
         def worker():
             ok = 0
