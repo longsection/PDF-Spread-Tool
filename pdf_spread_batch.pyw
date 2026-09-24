@@ -12,6 +12,17 @@ def ensure_pymupdf():
         import pymupdf
         return pymupdf
 
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff")
+
+def ensure_pillow():
+    try:
+        from PIL import Image
+        return Image
+    except Exception:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "Pillow"])
+        from PIL import Image
+        return Image
+
 def unique_output_paths(output_dir, base_name, need_pdf=True, need_jpg=False):
     """Choose a conflict-safe matched name without overwriting existing output."""
     n = 0
@@ -61,6 +72,34 @@ def merge_pdf(input_path, output_path, keep_front):
     out.save(output_path, garbage=4, deflate=True)
     out.close()
     src.close()
+
+def _auto_page_dpi(page, min_dpi=150, max_dpi=300):
+    try:
+        page_area = max(1.0, float(page.rect.width * page.rect.height))
+        infos = page.get_image_info()
+        best = None
+        best_area = 0.0
+        for info in infos:
+            bbox = info.get("bbox")
+            width = int(info.get("width") or 0)
+            height = int(info.get("height") or 0)
+            if not bbox or width <= 0 or height <= 0:
+                continue
+            x0, y0, x1, y1 = map(float, bbox)
+            bw, bh = abs(x1-x0), abs(y1-y0)
+            if bw <= 0 or bh <= 0:
+                continue
+            area = bw * bh
+            if area > best_area:
+                best_area = area
+                best = (width, height, bw, bh)
+        if best and best_area / page_area >= 0.35:
+            width, height, bw, bh = best
+            effective = min(width * 72.0 / bw, height * 72.0 / bh)
+            return int(round(max(min_dpi, min(max_dpi, effective))))
+    except Exception:
+        pass
+    return int(min_dpi)
 
 def _render_one_jpg_process(pdf_path, page_no, out_path, dpi, quality):
     # Top-level worker so Windows multiprocessing / PyInstaller can spawn it safely.
@@ -129,6 +168,55 @@ def export_pdf_to_jpg(pdf_path, jpg_dir, dpi=150, quality=90, pause_event=None,
                     progress_callback(done_count, page_count)
 
 
+def unique_jpg(output_dir, index, digits):
+    n = 0
+    while True:
+        suffix = "" if n == 0 else f" ({n})"
+        p = os.path.join(output_dir, f"{index:0{digits}d}{suffix}.jpg")
+        if not os.path.exists(p):
+            return p
+        n += 1
+
+def merge_image_sequence(paths, output_dir, keep_front=0, quality=90, pause_event=None, progress_callback=None):
+    Image = ensure_pillow()
+    paths = sorted(paths, key=lambda p: os.path.basename(p).lower())
+    if not paths:
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    total = min(keep_front, len(paths)) + (max(0, len(paths)-keep_front)+1)//2
+    digits = max(3, len(str(total)))
+    oi = 1
+    def to_rgb(im):
+        if im.mode in ("RGBA","LA") or (im.mode == "P" and "transparency" in im.info):
+            rgba = im.convert("RGBA")
+            white = Image.new("RGBA", rgba.size, (255,255,255,255))
+            white.alpha_composite(rgba)
+            return white.convert("RGB")
+        return im.convert("RGB")
+    def single(path):
+        nonlocal oi
+        if pause_event: pause_event.wait()
+        with Image.open(path) as im:
+            to_rgb(im).save(unique_jpg(output_dir, oi, digits), "JPEG", quality=quality)
+        if progress_callback: progress_callback(oi, total)
+        oi += 1
+    for p in paths[:min(keep_front, len(paths))]: single(p)
+    i = keep_front
+    while i < len(paths):
+        if i+1 >= len(paths):
+            single(paths[i]); break
+        if pause_event: pause_event.wait()
+        with Image.open(paths[i]) as a0, Image.open(paths[i+1]) as b0:
+            a, b = to_rgb(a0), to_rgb(b0)
+            h = min(a.height, b.height)
+            if a.height != h: a = a.resize((max(1, round(a.width*h/a.height)), h), Image.Resampling.LANCZOS)
+            if b.height != h: b = b.resize((max(1, round(b.width*h/b.height)), h), Image.Resampling.LANCZOS)
+            out = Image.new("RGB", (a.width+b.width, h))
+            out.paste(a, (0,0)); out.paste(b, (a.width,0))
+            out.save(unique_jpg(output_dir, oi, digits), "JPEG", quality=quality)
+        if progress_callback: progress_callback(oi, total)
+        oi += 1; i += 2
+
 def get_root_base():
     try:
         from tkinterdnd2 import TkinterDnD
@@ -157,7 +245,7 @@ class App(RootBase):
         self.keep_var = tk.IntVar(value=0)
         self.output_dir = tk.StringVar(value="")
         self.output_mode_var = tk.StringVar(value="merge_pdf")
-        self.jpg_dpi_var = tk.StringVar(value="150")
+        self.jpg_dpi_var = tk.StringVar(value="Auto")\n        self.mode_buttons = {}
         self.pause_event = threading.Event()
         self.pause_event.set()
         self.processing = False
@@ -165,13 +253,13 @@ class App(RootBase):
         top = tk.Frame(self)
         top.pack(fill="x", padx=14, pady=(14,8))
 
-        tk.Button(top, text="Add PDFs...", command=self.add_files, width=13).pack(side="left")
+        tk.Button(top, text="Add PDFs/Images...", command=self.add_files, width=13).pack(side="left")
         tk.Button(top, text="Remove selected", command=self.remove_selected, width=15).pack(side="left", padx=8)
         tk.Button(top, text="Clear", command=self.clear_files, width=9).pack(side="left")
 
         self.drop_label = tk.Label(
             self,
-            text="Drop PDF files here",
+            text="Drop PDF or image files here",
             relief="groove",
             bd=2,
             height=3,
@@ -224,11 +312,11 @@ class App(RootBase):
             value="original_jpg"
         ).grid(row=2, column=0, sticky="w", padx=12, pady=(3,8))
 
-        tk.Label(mode_frame, text="DPI:").grid(row=0, column=1, rowspan=3, sticky="e", padx=(24,4), pady=8)
+        self.image_spread_rb = tk.Radiobutton(mode_frame, text="Merge selected images side by side (0 gap)", variable=self.output_mode_var, value="image_spread")\n        self.image_spread_rb.grid(row=3, column=0, sticky="w", padx=12, pady=3)\n        tk.Label(mode_frame, text="DPI:").grid(row=0, column=1, rowspan=3, sticky="e", padx=(24,4), pady=8)
         dpi_box = ttk.Combobox(
             mode_frame,
             textvariable=self.jpg_dpi_var,
-            values=("150", "200", "300"),
+            values=("Auto", "150", "200", "300"),
             width=7,
             state="readonly"
         )
@@ -239,7 +327,7 @@ class App(RootBase):
         # display scaling enabled.
         info_label = tk.Label(
             self,
-            text="JPG export automatically uses all but one logical CPU core. Pause stops dispatching new pages.",
+            text="PDF JPG: Auto DPI preserves raster-page detail (150–300 DPI). Image spread supports JPG/PNG/WEBP/BMP/TIFF.",
             fg="#666"
         )
         info_label.pack(side="bottom", pady=(0,8))
@@ -289,7 +377,7 @@ class App(RootBase):
     def add_paths(self, paths):
         for p in paths:
             p = os.path.abspath(p)
-            if os.path.isfile(p) and p.lower().endswith(".pdf") and p not in self.files:
+            if os.path.isfile(p) and p.lower().endswith((".pdf",) + IMAGE_EXTS) and p not in self.files:
                 self.files.append(p)
                 self.tree.insert("", "end", iid=str(len(self.files)-1), values=(p, "Ready"))
         self.refresh_tree_ids()
@@ -302,6 +390,16 @@ class App(RootBase):
         for idx, p in enumerate(current):
             self.tree.insert("", "end", iid=str(idx), values=(p, "Ready"))
         self.count_label.config(text=f"{len(self.files)} files")
+        has_pdf = any(p.lower().endswith(".pdf") for p in self.files)
+        has_img = any(p.lower().endswith(IMAGE_EXTS) for p in self.files)
+        try:
+            self.image_spread_rb.config(state="normal" if has_img else "disabled")
+            if has_img and not has_pdf:
+                self.output_mode_var.set("image_spread")
+            elif has_pdf and not has_img and self.output_mode_var.get() == "image_spread":
+                self.output_mode_var.set("merge_pdf")
+        except Exception:
+            pass
 
     def on_drop(self, event):
         try:
@@ -320,7 +418,7 @@ class App(RootBase):
             self.output_dir.set(folder)
 
     def add_files(self):
-        paths = filedialog.askopenfilenames(title="Choose PDFs", filetypes=[("PDF files","*.pdf")])
+        paths = filedialog.askopenfilenames(title="Choose PDFs or images", filetypes=[("PDF files","*.pdf")])
         self.add_paths(paths)
 
     def remove_selected(self):
@@ -383,7 +481,7 @@ class App(RootBase):
 
         keep = self.keep_var.get()
         mode = self.output_mode_var.get()
-        dpi = int(self.jpg_dpi_var.get())
+        dpi = self.jpg_dpi_var.get()\n        if dpi != "Auto":\n            dpi = int(dpi)
         process_workers = None  # automatic: logical CPU count - 1
 
         self.processing = True
@@ -456,7 +554,7 @@ class App(RootBase):
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     try:
-        dropped = [p for p in sys.argv[1:] if os.path.isfile(p) and p.lower().endswith(".pdf")]
+        dropped = [p for p in sys.argv[1:] if os.path.isfile(p) and p.lower().endswith((".pdf",) + IMAGE_EXTS)]
         App(dropped).mainloop()
     except Exception:
         log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "error_log.txt")
